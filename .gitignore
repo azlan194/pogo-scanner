@@ -1,0 +1,11 @@
+# Ignore the secret token file
+.env
+
+# Ignore your local database cache so you don't push old data
+spawns_cache.json
+radar.html
+
+# Ignore Python bytecode
+__pycache__/
+*.pyc
+
