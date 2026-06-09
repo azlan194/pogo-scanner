@@ -18,7 +18,7 @@ load_dotenv()  # This looks for a local .env file and loads its variables into s
 
 # --- CONFIGURATION ---
 DEFAULT_LAT = 37.640220
-DEFAULT_LON = -122.423450 # San Bruno Area
+DEFAULT_LON = -122.423450  # San Bruno Area
 CACHE_FILE = "spawns_cache.json"
 HTML_FILE = "radar.html"
 PORT = 8080
@@ -27,11 +27,10 @@ API_URL = "https://api2.flymego.io/Coords/WildEncounter"
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 FLYMEGO_TOKEN = os.getenv("FLYMEGO_AUTH_TOKEN")
 
-
 with open('pokemon_id_map.json') as fi:
     poke_map = json.load(fi)['pokemon']
     POKEDEX = {int(k): v['name'] for k, v in poke_map.items()}
-    POKEDEX_flip= {name:id for id,name in POKEDEX.items()}
+    POKEDEX_flip = {name: id for id, name in POKEDEX.items()}
 
 HEADERS = {
     "authorization": FLYMEGO_TOKEN if FLYMEGO_TOKEN else "Bearer MISSING_TOKEN",
@@ -237,98 +236,36 @@ def process_radar_feed(raw_response_bytes, current_lat, current_lon, pkmn_id):
     return new_data_added, batch_count
 
 
-def display_sorted_radar(current_lat, current_lon):
-    """Reads the final combined cache database and renders the complete dashboard layout."""
-    radar_cache = load_local_cache()
-    radar_cache = clean_expired_entries(radar_cache)
+# --- ASYNC MULTI-THREADED SCANNER ENGINE ---
+def run_radar_scan_cycle(lat, lon, radius, pkmn_id, server_instance=None):
+    """Executes map scraping loop. Updates live thread states if attached to server."""
+    if server_instance:
+        server_instance.scan_in_progress = True
+        server_instance.spawns_found_current = 0
+        server_instance.scan_step_message = "Initializing radar array..."
 
-    if not radar_cache:
-        print("\n[🏜️] Radar Map clear.")
-        return
+    print(f"\n📡 [API] Requesting fresh radar data frame (Radius: {int(radius)}m)...")
+    call_count = 1
+    while True:
+        if server_instance:
+            server_instance.scan_step_message = f"Querying batch #{call_count}..."
 
-    # Recalculate distance and drive time on display pass in case you moved since the item cached
-    for k, v in radar_cache.items():
-        radar_cache[k]['distance_meters'] = calculate_distance(current_lat, current_lon, v['latitude'], v['longitude'])
-        drive_seconds, drive_text = get_driving_info(current_lat, current_lon, v['latitude'], v['longitude'])
-        radar_cache[k]['drive_seconds'] = drive_seconds
-        radar_cache[k]['drive_text'] = drive_text
+        payload = create_payload(lat, lon, radius)
+        response_data = fetch_spawns(payload)
+        has_more_data, batch_count = process_radar_feed(response_data, lat, lon, pkmn_id)
 
-    sorted_list = sorted(radar_cache.values(), key=lambda x: x['distance_meters'])
+        if server_instance:
+            server_instance.spawns_found_current += batch_count
+            server_instance.scan_step_message = f"Batch #{call_count}: Found {server_instance.spawns_found_current} targets..."
 
-    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    
-    # 1. Start building an HTML string
-    html_lines = [
-        "<!DOCTYPE html>",
-        "<html><head>",
-        "  <meta charset='UTF-8'>",  # <-- THIS LINE FIXES THE EMOJIS!
-        "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>",
-        "  <style>",
-        "    body { font-family: Arial, sans-serif; background: #121212; color: #E0E0E0; padding: 15px; }",
-        "    .card { background: #1E1E1E; padding: 15px; margin-bottom: 12px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }",
-        "    .green { border-left: 6px solid #4CAF50; } .red { border-left: 6px solid #F44336; }",
-        "    .name { font-size: 18px; font-weight: bold; color: #FFF; }",
-        "    .btn { display: inline-block; background: #00E676; color: #000; padding: 10px 15px; margin-top: 10px; border-radius: 5px; text-decoration: none; font-weight: bold; text-align: center; }",
-        "  </style></head><body>",
-        "  <h2>🛰️ Live Dynamic Radar</h2>"
-    ]
+        if not has_more_data:
+            print("[✔] Map space update complete.")
+            break
+        time.sleep(POLL_DELAY_SECONDS)
+        call_count += 1
 
-    print(f"\n=================== TACTICAL MOBILE RADAR ({len(sorted_list)} ACTIVE) ===================")
-    for index, target in enumerate(sorted_list, 1):
-        dt_obj = datetime.datetime.fromtimestamp(target['despawn_ms'] / 1000.0, tz=ZoneInfo("America/Los_Angeles"))
-        time_str = dt_obj.strftime('%I:%M:%S %p PDT')
-
-        # Calculate strict countdown time remaining
-        ms_left = target['despawn_ms'] - now_ms
-        seconds_left = max(0, int(ms_left / 1000))
-        minutes_left = seconds_left // 60
-        sec_remainder = seconds_left % 60
-        countdown_str = f"{minutes_left}m {sec_remainder}s remaining"
-
-        drive_seconds, drive_text = target['drive_seconds'], target['drive_text']
-        is_catchable = drive_seconds is not None and seconds_left > (drive_seconds + 60)
-        border_class = "green" if is_catchable else "red"
-
-        # Catchability Assessment Logic
-        if drive_seconds is not None:
-            # We add a 60-second buffer
-            if seconds_left > (drive_seconds + 60):
-                status_flag = f"✅ [CATCHABLE! Drive time: {drive_text} ]"
-            else:
-                status_flag = f"❌ [TOO LATE! Drive time: {drive_text} ]"
-        else:
-            status_flag = f"⚪ [Drive Time: {drive_text} ]"
-
-        stats_str = "Unscanned tier"
-
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={target['latitude']},{target['longitude']}"
-        
-        # Append target UI card
-        html_lines.append(f"""
-        <div class="card {border_class}">
-            <div class="name">{index}. {target['name']} ({target['distance_meters']}m away)</div>
-            <div><b>Status:</b> {status_flag}</div>
-            <div><b>Time Left:</b> {countdown_str}</div>
-            <div><b>Despawn Time:</b> {target['despawn_time']}</div>
-            <a class="btn" href="{maps_url}">🗺️ Open in Google Maps</a>
-        </div>
-        """)
-
-        print(f"{index}. {target['name']} | 📏 {target['distance_meters']}m away")
-        print(f"   Route Status: {status_flag}")
-        print(f"   Time Left:    {countdown_str} (Despawns: {time_str})")
-        print(f"   Despawn Time: {target['despawn_time']}")
-        print(f"   Navigation:   {maps_url}")
-        print("-" * 70)
-
-    html_lines.append("</body></html>")
-    
-    # 2. Write out the static HTML file
-    with open(HTML_FILE, "w", encoding="utf-8") as html_file:
-        html_file.writelines(html_lines)
-
-    return sorted_list
-
+    if server_instance:
+        server_instance.scan_in_progress = False
 
 
 # --- DYNAMIC HTML RENDER ENGINE ---
@@ -337,26 +274,26 @@ def generate_cards_html(current_lat, current_lon):
     radar_cache = load_local_cache()
     radar_cache = clean_expired_entries(radar_cache)
     sorted_list = sorted(radar_cache.values(), key=lambda x: x['distance_meters']) if radar_cache else []
-    
+
     html = [f"<h2>🟢 Active Mobile Targets ({len(sorted_list)})</h2>"]
-    
+
     if not sorted_list:
         html.append("<p style='color:#777;'>🏜️ No targets found within range. Click the Scan banner above!</p>")
-        
+
     for index, target in enumerate(sorted_list, 1):
         now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
         seconds_left = max(0, int((target['despawn_ms'] - now_ms) / 1000))
-        
+
         drive_seconds, drive_text = get_driving_info(current_lat, current_lon, target['latitude'], target['longitude'])
         is_catchable = drive_seconds is not None and seconds_left > (drive_seconds + 60)
-        
+
         border_class = "green" if is_catchable else "red"
         html_status = f"🚗 Catchable! ({drive_text} drive)" if is_catchable else f"⚠️ Too Late! ({drive_text} drive)"
         # stats_str = f"100% IV ({target['atk']}/{target['dfn']}/{target['sta']}) - Lvl {target['level']}" if target['atk'] is not None else "Unscanned tier"
-        
+
         maps_url = f"https://www.google.com/maps/search/?api=1&query={target['latitude']},{target['longitude']}"
         card_dom_id = f"card_{target['encounter_id']}"
-        
+
         html.append(f"""
         <div class="card {border_class}" id="{card_dom_id}">
             <div class="name">#{index}. {target['name']} ({target['distance_meters']}m away)</div>
@@ -372,46 +309,8 @@ def generate_cards_html(current_lat, current_lon):
     return "\n".join(html)
 
 
-# --- ASYNC MULTI-THREADED SCANNER ENGINE ---
-def run_radar_scan_cycle(lat, lon, radius, pkmn_id, server_instance=None):
-    """Executes map scraping loop. Updates live thread states if attached to server."""
-    if server_instance:
-        server_instance.scan_in_progress = True
-        server_instance.spawns_found_current = 0
-        server_instance.scan_step_message = "Initializing radar array..."
-
-    print(f"\n📡 [API] Requesting fresh radar data frame (Radius: {int(radius)}m)...")
-    call_count = 1
-    while True:
-        if server_instance:
-            server_instance.scan_step_message = f"Querying batch #{call_count}..."
-            
-        payload = create_payload(lat, lon, radius)
-        response_data = fetch_spawns(payload)
-        has_more_data, batch_count = process_radar_feed(response_data, lat, lon, pkmn_id)
-        
-        if server_instance:
-            server_instance.spawns_found_current += batch_count
-            server_instance.scan_step_message = f"Batch #{call_count}: Found {server_instance.spawns_found_current} targets..."
-            
-        if not has_more_data:
-            print("[✔] Map space update complete.")
-            break
-        time.sleep(POLL_DELAY_SECONDS)
-        call_count += 1
-
-    if server_instance:
-        server_instance.scan_in_progress = False
-
-
 # --- DYNAMIC HTML RENDER ENGINE ---
 def generate_dashboard_html(current_lat, current_lon, current_radius):
-    radar_cache = load_local_cache()
-    radar_cache = clean_expired_entries(radar_cache)
-    
-    sorted_list = sorted(radar_cache.values(), key=lambda x: x['distance_meters']) if radar_cache else []
-    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    
     html = [
         "<!DOCTYPE html><html><head><meta charset='UTF-8'>",
         "<meta name='viewport' content='width=device-width, initial-scale=1.0'>",
@@ -538,82 +437,53 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
         "",
         "<div id='card-container'>"
     ]
-    
-    if not sorted_list:
-        html.append("<p style='color:#777;'>🏜️ No targets found within range. Stand by...</p>")
-        
-    for index, target in enumerate(sorted_list, 1):
-        seconds_left = max(0, int((target['despawn_ms'] - now_ms) / 1000))
-        countdown_str = f"{seconds_left // 60}m {seconds_left % 60}s remaining"
-        
-        drive_seconds, drive_text = get_driving_info(current_lat, current_lon, target['latitude'], target['longitude'])
-        is_catchable = drive_seconds is not None and seconds_left > (drive_seconds + 60)
-        
-        border_class = "green" if is_catchable else "red"
-        html_status = f"🚗 Catchable! ({drive_text} drive)" if is_catchable else f"⚠️ Too Late! ({drive_text} drive)"
-        # stats_str = f"100% IV ({target['atk']}/{target['dfn']}/{target['sta']}) - Lvl {target['level']}" if target['atk'] is not None else "Unscanned tier"
-        
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={target['latitude']},{target['longitude']}"
-        card_dom_id = f"card_{index}"
-        
-        html.append(f"""
-        <div class="card {border_class}" id="{card_dom_id}">
-            <div class="name">#{index}. {target['name']} ({target['distance_meters']}m away)</div>
-            <div><b>Status:</b> {html_status}</div>
-            <div><b>Time Left:</b> <span class="live-timer" id="timer_{index}" data-card-id="{card_dom_id}" data-time="{target['despawn_ms']}">Calculating...</span></div>
-            <div><b>Despawn Time:</b> {target['despawn_time']}</div>
-            <div class="btn-box">
-                <a class="btn btn-maps" href="{maps_url}">🗺️ Open Maps</a>
-                <button class="btn btn-caught" onclick="markAsCaught('{card_dom_id}', '{target['encounter_id']}')">✨ Caught</button>            </div>
-        </div>
-        """)
-        
-    html.append("</body></html>")
+
+    html.append(generate_cards_html(current_lat, current_lon))
+    html.append("</div></body></html>")
     return "\n".join(html)
 
 
 # --- TERMUX LOCAL HOST SERVER INTERACTION ENGINE ---
 class RadarRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        return # Suppress standard server spam logs inside the terminal window
+        return  # Suppress standard server spam logs inside the terminal window
 
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
-        
+
         if parsed_url.path == "/":
             self.send_response(200)
             self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             html_content = generate_dashboard_html(self.server.my_lat, self.server.my_lon, self.server.scan_radius)
             self.wfile.write(html_content.encode("utf-8"))
-            
+
         elif parsed_url.path == "/live-update":
             # This endpoint feeds BOTH the UI status text AND the latest target cards
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            
+
             payload = {
                 "in_progress": self.server.scan_in_progress,
                 "message": self.server.scan_step_message,
                 "cards_html": generate_cards_html(self.server.my_lat, self.server.my_lon)
             }
             self.wfile.write(json.dumps(payload).encode("utf-8"))
-            
+
         else:
             self.send_error(404)
 
-
     def do_POST(self):
         parsed_url = urllib.parse.urlparse(self.path)
-        
+
         if parsed_url.path == "/scan":
             if self.server.scan_in_progress:
                 self.send_response(409)
                 self.end_headers()
                 self.wfile.write(b"SCAN_ALREADY_RUNNING")
                 return
-                
+
             params = urllib.parse.parse_qs(parsed_url.query)
             radius_param = params.get('radius', [None])[0]
             if radius_param:
@@ -621,19 +491,19 @@ class RadarRequestHandler(BaseHTTPRequestHandler):
                     self.server.scan_radius = float(radius_param)
                 except ValueError:
                     pass
-            
+
             worker = threading.Thread(
-                target=run_radar_scan_cycle, 
+                target=run_radar_scan_cycle,
                 args=(self.server.my_lat, self.server.my_lon, self.server.scan_radius, self.server.pkmn_id, self.server)
             )
             worker.daemon = True
             worker.start()
-            
+
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"STARTED")
             return
-            
+
         elif parsed_url.path == "/caught":
             params = urllib.parse.parse_qs(parsed_url.query)
             enc_id = params.get('id', [None])[0]
@@ -651,31 +521,31 @@ class RadarRequestHandler(BaseHTTPRequestHandler):
 
 # --- RUN ORCHESTRATOR ---
 def start_radar_workstation(pkmm_id, scan_radius):
-    # Fetch initial coordinates 
+    # Fetch initial coordinates
     my_lat, my_lon = get_android_gps()
     if not my_lat or not my_lon:
         print("[-] Absolute Failure: GPS tracking fix offline.")
         return
-        
+
     # Perform one initial baseline map scan right out of the gate
     run_radar_scan_cycle(my_lat, my_lon, scan_radius, pkmn_id)
-    
+
     print(f"\n📡 [ WEB DASHBOARD SERVER ONLINE ]")
     print(f"👉 Open your phone browser and go to: http://localhost:{PORT}")
     print("💡 Press CTRL+C inside Termux when you want to terminate the workstation environment.")
-    
+
     # Establish network host bindings and handoff parameters
     server = HTTPServer(('127.0.0.1', PORT), RadarRequestHandler)
     server.my_lat = my_lat
     server.my_lon = my_lon
     server.scan_radius = scan_radius
     server.pkmn_id = pkmn_id
-    
+
     # Global state management contexts
     server.scan_in_progress = False
     server.spawns_found_current = 0
     server.scan_step_message = ""
-    
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
