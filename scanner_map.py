@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()  # This looks for a local .env file and loads its variables into system memory
 
 # --- CONFIGURATION ---
+scan_thread_active = False
 DEFAULT_LAT = 37.640220
 DEFAULT_LON = -122.423450  # San Bruno Area
 CACHE_FILE = "spawns_cache.json"
@@ -317,18 +318,19 @@ def process_radar_feed(raw_response_bytes, current_lat, current_lon):
 # --- ASYNC MULTI-THREADED SCANNER ENGINE ---
 def run_radar_scan_cycle(lat, lon, radius, pkmn_id, server_instance=None):
     """Executes map scraping loop. Updates live thread states if attached to server."""
+    global scan_thread_active
     if server_instance:
         server_instance.scan_in_progress = True
         server_instance.spawns_found_current = 0
         server_instance.scan_step_message = "Initializing radar array..."
 
-    print(f"\n📡 [API] Requesting fresh radar data frame (Radius: {int(radius)}m)...")
+    print(f"\n📡 [API] Requesting fresh radar data frame (Radius: {int(radius)}m, Lat: {lat}, Lon: {lon})...")
     call_count = 1
-    while True:
+    while scan_thread_active:  # <--- Changed from 'while True:'
         timestamp = datetime.datetime.now().strftime('%H:%M:%S')
 
         # 1. Pre-request feedback
-        print(f"[{timestamp}] 🔄 Loop #{call_count}: Sending discovery request to Coords API...")
+        # print(f"[{timestamp}] 🔄 Loop #{call_count}: Sending discovery request to Coords API...")
         if server_instance:
             server_instance.scan_step_message = f"Querying batch #{call_count}..."
 
@@ -344,8 +346,8 @@ def run_radar_scan_cycle(lat, lon, radius, pkmn_id, server_instance=None):
             print("[✔] Map space update complete.")
             break
         # 3. Inter-loop wait feedback
-        print(f"[{timestamp}] 💡 Found pokemon spawned with distance: {dist}m")
-        print(f"[{timestamp}] 💤 Sleeping for {POLL_DELAY_SECONDS} seconds before starting Loop #{call_count + 1}...\n")
+        print(f"[{timestamp}] 🔄 Loop #{call_count}: Found pokemon spawned with distance: {dist}m")
+        # print(f"[{timestamp}] 💤 Sleeping for {POLL_DELAY_SECONDS} seconds before starting Loop #{call_count + 1}...\n")
         time.sleep(POLL_DELAY_SECONDS)
         call_count += 1
 
@@ -417,10 +419,13 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
         </div>
 
         <!-- RESTORED: Both Scan and Fetch buttons coexist -->
-        <div class="controls-row">
+        <div class='controls-row'>
             <input type="number" id="radiusInput" class="radius-input" value="{int(current_radius)}" placeholder="Meters">
             <button id="globalScanBtn" onclick="triggerGlobalScan()">🛰️ Scan Spawns</button>
             <button id="fetchStatsBtn" onclick="triggerFetchStats()">📊 Fetch Stats</button>
+            <label style="display:flex; align-items:center; background:#333; padding:5px 10px; border-radius:8px;">
+                <input type="checkbox" id="manualMode" onchange="toggleManualMode()"> Manual Mode
+            </label>
         </div>
 
         <div class="map-container">
@@ -431,10 +436,24 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
 
         <script>
             // 1. Initialize map and variables
+            let savedMode = localStorage.getItem('manualMode');
+            let isManualMode = (savedMode === 'true');
+            document.getElementById('manualMode').checked = isManualMode;
+            
             let liveLat = {current_lat};
             let liveLon = {current_lon};
             let currentZoom = 15;
-
+            
+            // NEW: Override default coordinates if we are in Manual Mode and have a saved pin
+            if (isManualMode) {{
+                let savedLat = localStorage.getItem('manualLat');
+                let savedLon = localStorage.getItem('manualLon');
+                if (savedLat !== null && savedLon !== null) {{
+                    liveLat = parseFloat(savedLat);
+                    liveLon = parseFloat(savedLon);
+                }}
+            }}
+            
             const map = L.map('map').setView([liveLat, liveLon], currentZoom);
 
             L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
@@ -442,59 +461,143 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
                 attribution: '© OpenStreetMap'
             }}).addTo(map);
 
-            // 2. Draw the transparent Scan Radius circle first (so it stays underneath)
+            // 2. Draw the transparent Scan Radius circle
             let scanRadius = L.circle([liveLat, liveLon], {{
                 color: '#4CAF50',
                 fillColor: '#4CAF50',
                 fillOpacity: 0.1,
                 weight: 2,
-                radius: {int(current_radius)},
-                interactive: false // Prevents the circle from swallowing touch events meant for Pokemon
+                radius: parseInt(document.getElementById('radiusInput').value) || 1000,
+                interactive: false
             }}).addTo(map);
+            
+            // --- NEW: Dynamically resize the circle when the input changes ---
+            document.getElementById('radiusInput').addEventListener('input', function(e) {{
+                let newRadius = parseInt(e.target.value);
+                // Only update if it's a valid number greater than 0
+                if (!isNaN(newRadius) && newRadius > 0) {{
+                    scanRadius.setRadius(newRadius);
+                }}
+            }});
 
-            // 3. Mark your current location
-            let userMarker = L.circleMarker([liveLat, liveLon], {{
-                color: '#2196F3',
-                fillColor: '#2196F3',
-                fillOpacity: 1.0,
-                radius: 8,
-                weight: 2
+            let gpsWatchId = null;
+
+            // 3. Mark your current location (Draggable if Manual Mode was saved)
+            let userMarker = L.marker([liveLat, liveLon], {{
+                draggable: isManualMode, 
+                icon: L.divIcon({{ html: '🔵', className: 'user-marker', iconSize: [20, 20] }})
             }}).addTo(map).bindPopup("<b>🚗 Your Location</b>");
 
-            // 4. Live GPS Tracking stream
-            if ('geolocation' in navigator) {{
-                navigator.geolocation.watchPosition(
-                    (position) => {{
-                        liveLat = position.coords.latitude;
-                        liveLon = position.coords.longitude;
+            // --- NEW: Sync the circle while dragging and update server on drop ---
+            userMarker.on('drag', function(e) {{
+                if (isManualMode) {{
+                    scanRadius.setLatLng(e.target.getLatLng());
+                }}
+            }});
 
-                        let newLatLng = new L.LatLng(liveLat, liveLon);
+            userMarker.on('dragend', function(e) {{
+                if (isManualMode) {{
+                    let pos = e.target.getLatLng();
+                    scanRadius.setLatLng(pos);
+                    liveLat = pos.lat;
+                    liveLon = pos.lng;
+                    
+                    // NEW: Save the exact drop coordinates to memory
+                    localStorage.setItem('manualLat', liveLat);
+                    localStorage.setItem('manualLon', liveLon);
+                    
+                    fetch('/update-location', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ lat: pos.lat, lon: pos.lng }})
+                    }});
+                }}
+            }});
+            
+            map.on('click', function(e) {{
+                if (isManualMode) {{
+                    let pos = e.latlng;
+                    liveLat = pos.lat;
+                    liveLon = pos.lng;
+                    
+                    userMarker.setLatLng(pos);
+                    scanRadius.setLatLng(pos);
+                    
+                    // NEW: Save the exact tap coordinates to memory
+                    localStorage.setItem('manualLat', liveLat);
+                    localStorage.setItem('manualLon', liveLon);
+                    
+                    fetch('/update-location', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ lat: pos.lat, lon: pos.lng }})
+                    }});
+                }}
+            }});
 
-                        // Move both the dot and the radius ring together
-                        userMarker.setLatLng(newLatLng);
-                        scanRadius.setLatLng(newLatLng);
-                    }},
-                    (err) => console.warn('GPS tracking error:', err),
-                    {{ enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }}
-                );
+            // 4. Toggle Mode Logic
+            function toggleManualMode() {{
+                isManualMode = document.getElementById('manualMode').checked;
+                localStorage.setItem('manualMode', isManualMode); // Save to browser memory
+                
+                if (isManualMode) {{
+                    if (gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
+                    userMarker.dragging.enable();
+                    alert("Manual Mode Enabled: Drag the blue dot to scan a new area.");
+                }} else {{
+                    userMarker.dragging.disable();
+                    startGpsTracking();
+                }}
             }}
 
-            // 5. Snap to Car Functionality
+            // 5. GPS Tracking stream
+            function startGpsTracking() {{
+                if ('geolocation' in navigator) {{
+                    gpsWatchId = navigator.geolocation.watchPosition(
+                        (position) => {{
+                            if (!isManualMode) {{
+                                liveLat = position.coords.latitude;
+                                liveLon = position.coords.longitude;
+                                
+                                let newLatLng = new L.LatLng(liveLat, liveLon);
+                                userMarker.setLatLng(newLatLng);
+                                scanRadius.setLatLng(newLatLng);
+                                
+                                // Keep Python server updated as you drive
+                                fetch('/update-location', {{
+                                    method: 'POST',
+                                    headers: {{ 'Content-Type': 'application/json' }},
+                                    body: JSON.stringify({{ lat: liveLat, lon: liveLon }})
+                                }});
+                            }}
+                        }},
+                        (err) => console.warn('GPS error:', err),
+                        {{ enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }}
+                    );
+                }}
+            }}
+
+            // Start tracking on load ONLY if not in manual mode
+            if (!isManualMode) {{
+                startGpsTracking();
+            }}
+
+            // 6. Snap to Car
             function snapToCar() {{
                 map.setView([liveLat, liveLon], currentZoom, {{ animate: true }});
             }}
 
-            // 6. Fetch target data and plot Sprites
+            // 7. Fetch target data and plot Sprites
             fetch('/api/spawns')
                 .then(res => res.json())
                 .then(data => {{
                     data.forEach(spawn => {{
                         let statsHtml = spawn.cp 
-                            ? `<div class="popup-stats">⭐ $100% IV (${{spawn.stats}})<br>CP ${{spawn.cp}}<br>Lvl ${{spawn.lvl}}</div>`
+                            ? `<div class="popup-stats">⭐ $100% IV (${{spawn.stats}})<br>CP ${{spawn.cp}}<br>Level ${{spawn.lvl}}</div>`
                             : `<div style="color:#888; font-style:italic;">📊 Stats Unscanned</div>`;
-
+                        
                         let driveInfo = spawn.drive_text ? `🚗 ${{spawn.drive_text}} drive` : 'Drive time unknown';
-
+                        
                         let popupContent = `
                             <h3 style="margin:0 0 5px 0; text-align:center;">${{spawn.name}}</h3>
                             ${{statsHtml}}
@@ -504,7 +607,7 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
                         `;
 
                         let spriteUrl = `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${{spawn.pokemon_id}}.png`;
-
+                        
                         let pkmnIcon = L.icon({{
                             iconUrl: spriteUrl,
                             iconSize: [64, 64],
@@ -520,13 +623,18 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
                 }})
                 .catch(err => console.error("Error loading spawn data:", err));
 
-            // 7. Button Triggers
+            // 8. Button Triggers
             function triggerGlobalScan() {{
                 const radius = document.getElementById('radiusInput').value;
-                fetch(`/scan?radius=${{radius}}`, {{ method: 'POST' }})
-                .then(() => alert('Discovery Phase started in the background.'))
+                
+                // Explicitly send the live map coordinates to the Python server
+                const scanUrl = `/scan?lat=${{liveLat}}&lon=${{liveLon}}&radius=${{radius}}`;
+                
+                fetch(scanUrl, {{ method: 'POST' }})
+                .then(() => alert(`Discovery Phase started at ${{liveLat.toFixed(4)}}, ${{liveLon.toFixed(4)}}`))
                 .catch(() => alert('Network error.'));
             }}
+            
 
             function triggerFetchStats() {{
                 const btn = document.getElementById('fetchStatsBtn');
@@ -570,8 +678,8 @@ class RadarRequestHandler(BaseHTTPRequestHandler):
 
             payload = {
                 "in_progress": self.server.scan_in_progress,
-                "message": self.server.scan_step_message,
-                "cards_html": generate_cards_html(self.server.my_lat, self.server.my_lon)
+                "message": self.server.scan_step_message
+                # "cards_html": generate_cards_html(self.server.my_lat, self.server.my_lon)
             }
             self.wfile.write(json.dumps(payload).encode("utf-8"))
 
@@ -595,31 +703,33 @@ class RadarRequestHandler(BaseHTTPRequestHandler):
         parsed_url = urllib.parse.urlparse(self.path)
 
         if parsed_url.path == "/scan":
-            if self.server.scan_in_progress:
-                self.send_response(409)
-                self.end_headers()
-                self.wfile.write(b"SCAN_ALREADY_RUNNING")
-                return
+            query_components = urllib.parse.parse_qs(parsed_url.query)
 
-            self.server.my_lat, self.server.my_lon = get_android_gps()
-            params = urllib.parse.parse_qs(parsed_url.query)
-            radius_param = params.get('radius', [None])[0]
-            if radius_param:
-                try:
-                    self.server.scan_radius = float(radius_param)
-                except ValueError:
-                    pass
+            # 1. Pull the exact map coordinates sent by the browser
+            target_lat = float(query_components.get('lat', [self.server.my_lat])[0])
+            target_lon = float(query_components.get('lon', [self.server.my_lon])[0])
+            radius = int(query_components.get('radius', [1000])[0])
 
+            # 2. Update the global server state so Fetch Stats uses the new location too
+            self.server.my_lat = target_lat
+            self.server.my_lon = target_lon
+
+            # 3. Safely handle the background loop
+            global scan_thread_active
+            scan_thread_active = False  # Kill any existing background scanner
+            time.sleep(0.5)  # Give it a moment to die
+            scan_thread_active = True  # Green light for the new scanner
+
+            # 4. Start the new scanner thread with the new coordinates
             worker = threading.Thread(
                 target=run_radar_scan_cycle,
-                args=(self.server.my_lat, self.server.my_lon, self.server.scan_radius, self.server.pkmn_id, self.server)
+                args=(target_lat, target_lon, radius, self.server.pkmn_id)
             )
             worker.daemon = True
             worker.start()
 
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"STARTED")
             return
 
         elif parsed_url.path == "/caught":
@@ -647,6 +757,20 @@ class RadarRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(500)  # Send an error code if the History API failed
                 self.end_headers()
                 self.wfile.write(b"ENRICHMENT_FAILED")
+            return
+
+        # Add this route to do_POST in RadarRequestHandler
+        elif parsed_url.path == "/update-location":
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+
+            # Update the global server coordinates
+            self.server.my_lat = float(data['lat'])
+            self.server.my_lon = float(data['lon'])
+
+            self.send_response(200)
+            self.end_headers()
             return
 
 
