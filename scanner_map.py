@@ -442,7 +442,10 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
             
             let liveLat = {current_lat};
             let liveLon = {current_lon};
-            let currentZoom = 15;
+            
+            // NEW: Restore Zoom level from memory, default to 15 if not found
+            let savedZoom = localStorage.getItem('mapZoom');
+            let currentZoom = savedZoom ? parseInt(savedZoom) : 15;
             
             // NEW: Override default coordinates if we are in Manual Mode and have a saved pin
             if (isManualMode) {{
@@ -455,6 +458,12 @@ def generate_dashboard_html(current_lat, current_lon, current_radius):
             }}
             
             const map = L.map('map').setView([liveLat, liveLon], currentZoom);
+
+            // NEW: Save zoom level to memory every time the user zooms in or out
+            map.on('zoomend', function() {{
+                localStorage.setItem('mapZoom', map.getZoom());
+                currentZoom = map.getZoom();
+            }});
 
             L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
                 maxZoom: 19,
